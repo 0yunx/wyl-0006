@@ -1,6 +1,5 @@
 import re
 import html
-from typing import Optional
 from urllib.parse import urlparse, parse_qs, unquote
 
 import httpx
@@ -10,6 +9,25 @@ mcp = FastMCP("WebSearch")
 
 SEARCH_URL = "https://html.duckduckgo.com/html/"
 TIMEOUT = 10.0
+MAX_COUNT = 20
+_QUERY_SANITIZER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+_client = httpx.Client(
+    timeout=TIMEOUT,
+    headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    },
+    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+)
+
+
+def _sanitize_query(query: str) -> str:
+    cleaned = _QUERY_SANITIZER.sub("", query).strip()
+    return cleaned
 
 
 def _extract_real_url(ddg_url: str) -> str:
@@ -47,7 +65,7 @@ def _parse_search_results(search_html: str) -> list[dict]:
 
 
 @mcp.tool()
-def web_search(query: str, count: Optional[int] = 5) -> list[dict]:
+def web_search(query: str, count: int = 5) -> list[dict]:
     """
     Search the web using DuckDuckGo and return results sorted by relevance.
 
@@ -55,37 +73,36 @@ def web_search(query: str, count: Optional[int] = 5) -> list[dict]:
         query: The search query string.
         count: Number of results to return (1-20, default: 5).
     """
-    if count is None:
-        count = 5
-    if count < 1:
-        count = 1
-    if count > 20:
-        count = 20
-
-    results: list[dict] = []
-
-    try:
-        response = httpx.get(
-            SEARCH_URL,
-            params={"q": query},
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0 Safari/537.36"
-                )
-            },
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        results = _parse_search_results(response.text)
-    except (httpx.TimeoutException, httpx.HTTPError, Exception) as exc:
+    query = _sanitize_query(query)
+    if not query:
         return [
             {
-                "error": f"Search request failed: {exc}",
-                "title": "",
+                "title": "No results",
                 "url": "",
-                "snippet": "",
+                "snippet": "Empty query after sanitization",
+            }
+        ]
+
+    count = max(1, min(count, MAX_COUNT))
+
+    try:
+        response = _client.get(SEARCH_URL, params={"q": query})
+        response.raise_for_status()
+        results = _parse_search_results(response.text)
+    except httpx.TimeoutException:
+        return [
+            {
+                "title": "Request timed out",
+                "url": "",
+                "snippet": "The search request timed out, please try again later",
+            }
+        ]
+    except httpx.HTTPError:
+        return [
+            {
+                "title": "Request failed",
+                "url": "",
+                "snippet": "The search request failed due to a network error",
             }
         ]
 
