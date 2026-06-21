@@ -9,17 +9,30 @@ from urllib.parse import urlparse, parse_qs, unquote
 import httpx
 from fastmcp import FastMCP
 
-mcp = FastMCP("WebSearch")
-
 SEARCH_URL = "https://html.duckduckgo.com/html/"
 TIMEOUT = 10.0
 MAX_COUNT = 20
+MAX_QUERY_LENGTH = 1024
 _QUERY_SANITIZER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 _CACHE_MAX_SIZE = 64
-_CACHE_TTL = int(os.environ.get("WEB_SEARCH_CACHE_TTL", "300"))
-_search_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+_DEFAULT_CACHE_TTL = 300
+_search_cache: "OrderedDict[tuple[str, int], tuple[float, list[dict]]]" = OrderedDict()
 _cache_lock = threading.Lock()
+_cache_ttl: int | None = None
+
+
+def _get_cache_ttl() -> int:
+    global _cache_ttl
+    if _cache_ttl is not None:
+        return _cache_ttl
+    try:
+        raw = os.environ.get("WEB_SEARCH_CACHE_TTL", str(_DEFAULT_CACHE_TTL))
+        _cache_ttl = max(1, int(raw))
+    except (ValueError, TypeError):
+        _cache_ttl = _DEFAULT_CACHE_TTL
+    return _cache_ttl
+
 
 _client = httpx.Client(
     timeout=TIMEOUT,
@@ -33,10 +46,12 @@ _client = httpx.Client(
     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
 )
 
+mcp = FastMCP("WebSearch")
+
 
 def _sanitize_query(query: str) -> str:
     cleaned = _QUERY_SANITIZER.sub("", query).strip()
-    return cleaned
+    return cleaned[:MAX_QUERY_LENGTH]
 
 
 def _extract_real_url(ddg_url: str) -> str:
@@ -73,6 +88,15 @@ def _parse_search_results(search_html: str) -> list[dict]:
     return results
 
 
+def _is_valid_result(results: list[dict]) -> bool:
+    if not results:
+        return False
+    first = results[0]
+    if first.get("url", "") == "":
+        return False
+    return True
+
+
 def _do_http_search(query: str, count: int) -> list[dict]:
     try:
         response = _client.get(SEARCH_URL, params={"q": query})
@@ -107,18 +131,18 @@ def _do_http_search(query: str, count: int) -> list[dict]:
     return results[:count]
 
 
-def _cache_lookup(key: str) -> list[dict] | None:
+def _cache_lookup(key: "tuple[str, int]") -> list[dict] | None:
     with _cache_lock:
         if key in _search_cache:
             ts, results = _search_cache[key]
-            if time.time() - ts < _CACHE_TTL:
+            if time.time() - ts < _get_cache_ttl():
                 _search_cache.move_to_end(key)
                 return [dict(r) for r in results]
             del _search_cache[key]
     return None
 
 
-def _cache_store(key: str, results: list[dict]) -> None:
+def _cache_store(key: "tuple[str, int]", results: list[dict]) -> None:
     with _cache_lock:
         if key in _search_cache:
             del _search_cache[key]
@@ -149,7 +173,7 @@ def _execute_search(
         return _empty_query_result(mark_cached_field)
 
     count = max(1, min(count, MAX_COUNT))
-    cache_key = f"{query}\x00{count}"
+    cache_key = (query, count)
 
     if use_cache:
         cached = _cache_lookup(cache_key)
@@ -160,7 +184,7 @@ def _execute_search(
 
     results = _do_http_search(query, count)
 
-    if use_cache:
+    if use_cache and _is_valid_result(results):
         _cache_store(cache_key, results)
 
     results = [dict(r) for r in results]
