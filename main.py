@@ -16,6 +16,15 @@ MAX_COUNT = 20
 MAX_QUERY_LENGTH = 1024
 _QUERY_SANITIZER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    )
+}
+_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+
 _CACHE_MAX_SIZE = 64
 _DEFAULT_CACHE_TTL = 300
 _search_cache: "OrderedDict[tuple[str, int], tuple[float, list[dict]]]" = OrderedDict()
@@ -37,26 +46,14 @@ def _get_cache_ttl() -> int:
 
 _client = httpx.Client(
     timeout=TIMEOUT,
-    headers={
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
-    },
-    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    headers=_HEADERS,
+    limits=_LIMITS,
 )
 
 _async_client = httpx.AsyncClient(
     timeout=TIMEOUT,
-    headers={
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
-    },
-    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    headers=_HEADERS,
+    limits=_LIMITS,
 )
 
 mcp = FastMCP("WebSearch")
@@ -250,7 +247,7 @@ _MULTI_MAX_TOTAL_RESULTS = 50
 
 
 @mcp.tool()
-async def web_search_multitool(
+async def web_search_multi(
     queries: list[str],
     count: int = 3,
 ) -> dict[str, list[dict]]:
@@ -267,6 +264,11 @@ async def web_search_multitool(
         raise ValueError(
             f"queries must be a list of 1-{_MULTI_MAX_QUERIES} strings"
         )
+    for i, q in enumerate(queries):
+        if not isinstance(q, str):
+            raise TypeError(
+                f"queries[{i}] must be a str, got {type(q).__name__}"
+            )
     count = max(1, min(count, _MULTI_MAX_COUNT_PER_QUERY))
 
     sanitized: list[tuple[str, str]] = []
