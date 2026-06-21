@@ -1,5 +1,8 @@
 import re
+import os
+import time
 import html
+from collections import OrderedDict
 from urllib.parse import urlparse, parse_qs, unquote
 
 import httpx
@@ -11,6 +14,10 @@ SEARCH_URL = "https://html.duckduckgo.com/html/"
 TIMEOUT = 10.0
 MAX_COUNT = 20
 _QUERY_SANITIZER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+_CACHE_MAX_SIZE = 64
+_CACHE_TTL = int(os.environ.get("WEB_SEARCH_CACHE_TTL", "300"))
+_search_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 
 _client = httpx.Client(
     timeout=TIMEOUT,
@@ -84,7 +91,28 @@ def web_search(query: str, count: int = 5) -> list[dict]:
         ]
 
     count = max(1, min(count, MAX_COUNT))
+    return _do_search(query, count)
 
+
+def _cache_get(key: str) -> list[dict] | None:
+    if key in _search_cache:
+        ts, results = _search_cache[key]
+        if time.time() - ts < _CACHE_TTL:
+            _search_cache.move_to_end(key)
+            return results
+        del _search_cache[key]
+    return None
+
+
+def _cache_set(key: str, results: list[dict]) -> None:
+    if key in _search_cache:
+        del _search_cache[key]
+    _search_cache[key] = (time.time(), results)
+    while len(_search_cache) > _CACHE_MAX_SIZE:
+        _search_cache.popitem(last=False)
+
+
+def _do_search(query: str, count: int) -> list[dict]:
     try:
         response = _client.get(SEARCH_URL, params={"q": query})
         response.raise_for_status()
@@ -116,6 +144,47 @@ def web_search(query: str, count: int = 5) -> list[dict]:
         ]
 
     return results[:count]
+
+
+@mcp.tool()
+def web_search_cache(query: str, count: int = 5) -> list[dict]:
+    """
+    Search the web using DuckDuckGo with LRU cache (max 64 entries, TTL 300s).
+    Behaves identically to web_search but caches results; on cache hit the
+    first result includes _cached=True so the caller knows the data may be stale.
+
+    Args:
+        query: The search query string.
+        count: Number of results to return (1-20, default: 5).
+    """
+    query = _sanitize_query(query)
+    if not query:
+        return [
+            {
+                "title": "No results",
+                "url": "",
+                "snippet": "Empty query after sanitization",
+                "_cached": False,
+            }
+        ]
+
+    count = max(1, min(count, MAX_COUNT))
+    cache_key = f"{query}\x00{count}"
+
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        results = [dict(r) for r in cached]
+        if results:
+            results[0]["_cached"] = True
+        return results
+
+    results = _do_search(query, count)
+    _cache_set(cache_key, results)
+
+    results = [dict(r) for r in results]
+    if results:
+        results[0]["_cached"] = False
+    return results
 
 
 def main():
