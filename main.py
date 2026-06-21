@@ -1,3 +1,4 @@
+import asyncio
 import re
 import os
 import time
@@ -35,6 +36,18 @@ def _get_cache_ttl() -> int:
 
 
 _client = httpx.Client(
+    timeout=TIMEOUT,
+    headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    },
+    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+)
+
+_async_client = httpx.AsyncClient(
     timeout=TIMEOUT,
     headers={
         "User-Agent": (
@@ -217,6 +230,80 @@ def web_search_cache(query: str, count: int = 5) -> list[dict]:
         count: Number of results to return (1-20, default: 5).
     """
     return _execute_search(query, count, use_cache=True, mark_cached_field=True)
+
+
+async def _do_async_http_search(query: str, count: int) -> list[dict]:
+    try:
+        response = await _async_client.get(SEARCH_URL, params={"q": query})
+        response.raise_for_status()
+        results = _parse_search_results(response.text)
+    except (httpx.TimeoutException, httpx.HTTPError, Exception):
+        return []
+    if not results:
+        return []
+    return results[:count]
+
+
+_MULTI_MAX_QUERIES = 5
+_MULTI_MAX_COUNT_PER_QUERY = 5
+_MULTI_MAX_TOTAL_RESULTS = 50
+
+
+@mcp.tool()
+async def web_search_multitool(
+    queries: list[str],
+    count: int = 3,
+) -> dict[str, list[dict]]:
+    """
+    Search the web for multiple queries concurrently using DuckDuckGo.
+    Returns a dict mapping each original query string to its result list.
+    Failed or timed-out queries produce an empty list and do not block others.
+
+    Args:
+        queries: 1-5 search query strings.
+        count: Results per query (1-5, default: 3). Total capped at 50.
+    """
+    if not isinstance(queries, list) or not (1 <= len(queries) <= _MULTI_MAX_QUERIES):
+        raise ValueError(
+            f"queries must be a list of 1-{_MULTI_MAX_QUERIES} strings"
+        )
+    count = max(1, min(count, _MULTI_MAX_COUNT_PER_QUERY))
+
+    sanitized: list[tuple[str, str]] = []
+    for q in queries:
+        s = _sanitize_query(q)
+        if s:
+            sanitized.append((q, s))
+
+    if not sanitized:
+        return {q: [] for q in queries}
+
+    async def _search_one(original: str, clean: str) -> tuple[str, list[dict]]:
+        try:
+            results = await _do_async_http_search(clean, count)
+            return original, results
+        except Exception:
+            return original, []
+
+    tasks = [_search_one(orig, cln) for orig, cln in sanitized]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    output: dict[str, list[dict]] = {q: [] for q in queries}
+    total = 0
+    for item in gathered:
+        if isinstance(item, Exception):
+            continue
+        original, results = item
+        if total >= _MULTI_MAX_TOTAL_RESULTS:
+            results = []
+        else:
+            remaining = _MULTI_MAX_TOTAL_RESULTS - total
+            if len(results) > remaining:
+                results = results[:remaining]
+            total += len(results)
+        output[original] = results
+
+    return output
 
 
 def main():
